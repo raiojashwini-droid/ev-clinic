@@ -5,7 +5,7 @@ import { startTime } from '../utils/system.js';
 
 // ==================== CLINICS ====================
 export const createClinic = async (data: any) => {
-    const { name, location, email, contact, subscriptionDuration = 1, subscriptionPlan = 'Monthly', manualDays = 30, password, numberOfUsers = 5 } = data;
+    const { name, location, email, contact, subscriptionDuration = 1, subscriptionPlan = 'Monthly', manualDays = 30, trialDays = 7, password, numberOfUsers = 5 } = data;
     console.log(data.logo)
     if (!name || !email || !contact || !password) {
         throw new AppError('Name, Email, Contact Number, and Password are all required.', 400);
@@ -22,7 +22,8 @@ export const createClinic = async (data: any) => {
     const start = new Date();
     const end = new Date();
     if (subscriptionPlan === 'Trial') {
-        end.setDate(start.getDate() + 7);
+        const tDays = Number(data.trialDays || trialDays || 7);
+        end.setDate(start.getDate() + tDays);
     } else if (subscriptionPlan === 'Manual') {
         end.setDate(start.getDate() + Number(manualDays));
     } else {
@@ -148,44 +149,53 @@ export const getClinics = async () => {
         }
     });
 
-    return clinics.map(clinic => {
-        const isExpired = clinic.subscriptionEnd ? new Date() > clinic.subscriptionEnd : false;
+    return clinics.map(clinic => formatClinicDetails(clinic));
+};
 
-        // Count roles specifically
-        const doctors = clinic.clinicstaff.filter(s => s.role === 'DOCTOR').length;
-        const admins = clinic.clinicstaff.filter(s => (s as any).role === 'ADMIN');
-        const adminName = admins.length > 0 ? (admins[0] as any).user.name : 'N/A';
-        const adminEmail = admins.length > 0 ? (admins[0] as any).user.email : 'N/A';
-        const adminCount = admins.length;
-        const totalStaffRecords = clinic.clinicstaff.length;
-        const otherStaff = totalStaffRecords - doctors - adminCount;
+export const formatClinicDetails = (clinic: any) => {
+    if (!clinic) return null;
+    const now = new Date();
+    const isExpired = clinic.subscriptionEnd ? now > new Date(clinic.subscriptionEnd) : true;
 
-        // Calculate Revenue
-        const totalRevenue = clinic.subscriptionInvoices.reduce((sum, inv) => sum + Number(inv.amount), 0);
-        const totalInvoices = clinic._count.subscriptionInvoices;
+    // Count roles specifically
+    const doctors = clinic.clinicstaff ? clinic.clinicstaff.filter((s: any) => s.role === 'DOCTOR').length : 0;
+    const admins = clinic.clinicstaff ? clinic.clinicstaff.filter((s: any) => (s as any).role === 'ADMIN') : [];
+    const adminName = admins.length > 0 ? (admins[0] as any).user?.name || 'Admin' : 'Admin';
+    const adminEmail = admins.length > 0 ? (admins[0] as any).user?.email || 'N/A' : 'N/A';
+    const adminCount = admins.length;
+    const totalStaffRecords = clinic.clinicstaff ? clinic.clinicstaff.length : 0;
+    const otherStaff = totalStaffRecords - doctors - adminCount;
 
-        const daysRemaining = clinic.subscriptionEnd
-            ? Math.ceil((new Date(clinic.subscriptionEnd).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24))
-            : 0;
+    // Calculate Revenue
+    const totalRevenue = clinic.subscriptionInvoices ? clinic.subscriptionInvoices.reduce((sum: number, inv: any) => sum + Number(inv.amount || 0), 0) : 0;
+    const totalInvoices = clinic._count?.subscriptionInvoices || (clinic.subscriptionInvoices ? clinic.subscriptionInvoices.length : 0);
 
-        return {
-            ...clinic,
-            modules: clinic.modules ? (typeof clinic.modules === 'string' ? JSON.parse(clinic.modules) : clinic.modules) : { pharmacy: true, radiology: true, laboratory: true, billing: true },
-            isExpired,
-            daysRemaining: daysRemaining > 0 ? daysRemaining : 0,
-            adminName,
-            adminEmail,
-            counts: {
-                patients: clinic._count.patient,
-                doctors,
-                admins: adminCount,
-                staff: otherStaff > 0 ? otherStaff : 0,
-                appointments: clinic._count.appointment,
-                totalRevenue,
-                totalInvoices
-            }
+    const daysRemaining = clinic.subscriptionEnd
+        ? Math.ceil((new Date(clinic.subscriptionEnd).getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+        : 0;
+
+    const isExp = isExpired || daysRemaining <= 0 || (clinic.status || '').toLowerCase() !== 'active' || clinic.isActive === false;
+    const effectiveStatus = isExp ? 'inactive' : (clinic.status || 'active');
+
+    return {
+        ...clinic,
+        status: effectiveStatus,
+        isActive: effectiveStatus === 'active',
+        modules: clinic.modules ? (typeof clinic.modules === 'string' ? JSON.parse(clinic.modules) : clinic.modules) : { pharmacy: true, radiology: true, laboratory: true, billing: true },
+        isExpired: isExp,
+        daysRemaining: isExp ? 0 : (daysRemaining > 0 ? daysRemaining : 0),
+        adminName,
+        adminEmail,
+        counts: {
+            patients: clinic._count?.patient || 0,
+            doctors,
+            admins: adminCount,
+            staff: otherStaff > 0 ? otherStaff : 0,
+            appointments: clinic._count?.appointment || 0,
+            totalRevenue,
+            totalInvoices
         }
-    });
+    };
 };
 
 export const generateClinicInvoice = async (clinicId: number, amount: number, description: string) => {
@@ -337,15 +347,35 @@ export const getSuperAdminReports = async (startDate?: string, endDate?: string)
 
 export const updateClinic = async (id: number, data: any) => {
     // Extract password and other non-clinic fields
-    const { password, subscriptionDuration, manualDays, subscriptionAmount, gstPercent, numberOfUsers, ...clinicData } = data;
+    const {
+        password,
+        subscriptionDuration,
+        manualDays,
+        trialDays,
+        subscriptionAmount,
+        gstPercent,
+        numberOfUsers,
+        adminName,
+        adminEmail,
+        daysRemaining,
+        isExpired,
+        counts,
+        adminUser,
+        clinicstaff,
+        subscriptionInvoices,
+        _count,
+        id: dummyId,
+        ...clinicData
+    } = data;
 
-    // Sanitize logo to ensure it's a string path or removed if invalid
-    if (clinicData.logo && typeof clinicData.logo !== 'string') {
-        delete (clinicData as any).logo;
+    // Sanitize logo to ensure it's a string path or null
+    let logoValue: string | null | undefined = undefined;
+    if (clinicData.logo !== undefined) {
+        logoValue = typeof clinicData.logo === 'string' && clinicData.logo.trim() !== '' ? clinicData.logo : null;
     }
 
     // If password is provided and not empty, update the admin user's password
-    if (password && password.trim() !== '') {
+    if (password && typeof password === 'string' && password.trim() !== '') {
         // Find the admin user for this clinic
         const adminStaff = await prisma.clinicstaff.findFirst({
             where: {
@@ -358,7 +388,7 @@ export const updateClinic = async (id: number, data: any) => {
         });
 
         if (adminStaff) {
-            const hashedPassword = await bcrypt.hash(password, 12);
+            const hashedPassword = await bcrypt.hash(password.trim(), 12);
             await prisma.user.update({
                 where: { id: adminStaff.userId },
                 data: { password: hashedPassword }
@@ -367,37 +397,77 @@ export const updateClinic = async (id: number, data: any) => {
     }
 
     // Handle subscription updates if provided
-    if (subscriptionDuration !== undefined || manualDays !== undefined || clinicData.subscriptionPlan) {
-        // Fetch current clinic to get existing subscription plan if not provided
-        const currentClinic = clinicData.subscriptionPlan ? null : await prisma.clinic.findUnique({
-            where: { id },
-            select: { subscriptionPlan: true, subscriptionStart: true }
-        });
+    let calculatedEnd: Date | undefined = undefined;
+    let calculatedStart: Date | undefined = undefined;
+    let calculatedPlan: string | undefined = clinicData.subscriptionPlan ? String(clinicData.subscriptionPlan) : undefined;
+    let isPlanActive: boolean | undefined = undefined;
+    let planStatus: string | undefined = undefined;
 
-        const start = clinicData.subscriptionPlan ? new Date() : (currentClinic?.subscriptionStart || new Date());
-        const end = new Date();
-        const plan = clinicData.subscriptionPlan || currentClinic?.subscriptionPlan || 'Monthly';
-        const duration = subscriptionDuration || 1;
-        const days = manualDays || 30;
+    if (subscriptionDuration !== undefined || manualDays !== undefined || trialDays !== undefined || clinicData.subscriptionPlan) {
+        const plan = String(clinicData.subscriptionPlan || 'Monthly');
+        calculatedPlan = plan;
+        const start = new Date();
+        calculatedStart = start;
+        let end = new Date(start);
+        const duration = Number(subscriptionDuration) > 0 ? Number(subscriptionDuration) : 1;
+        const days = Number(manualDays) > 0 ? Number(manualDays) : 30;
+        const tDays = Number(trialDays !== undefined && trialDays !== '' ? trialDays : 7);
 
         if (plan === 'Trial') {
-            end.setDate(start.getDate() + 7);
+            end.setDate(start.getDate() + (tDays > 0 ? tDays : 7));
+            isPlanActive = true;
+            planStatus = 'active';
         } else if (plan === 'Manual') {
-            end.setDate(start.getDate() + Number(days));
+            end.setDate(start.getDate() + (days > 0 ? days : 30));
+            isPlanActive = true;
+            planStatus = 'active';
+        } else if (plan === 'Yearly') {
+            end.setFullYear(start.getFullYear() + duration);
+            isPlanActive = true;
+            planStatus = 'active';
         } else {
-            end.setMonth(start.getMonth() + Number(duration));
+            // Monthly
+            end.setMonth(start.getMonth() + duration);
+            isPlanActive = true;
+            planStatus = 'active';
         }
 
-        clinicData.subscriptionEnd = end;
-        if (clinicData.subscriptionPlan) {
-            clinicData.subscriptionStart = start;
-        }
+        calculatedEnd = end;
     }
 
-    // Update clinic with only valid clinic fields
-    const clinic = await prisma.clinic.update({
+    // Construct strictly whitelisted Prisma update object
+    const sanitizedUpdate: any = {};
+    if (clinicData.name !== undefined) sanitizedUpdate.name = String(clinicData.name);
+    if (clinicData.subdomain !== undefined) sanitizedUpdate.subdomain = String(clinicData.subdomain);
+    if (clinicData.location !== undefined) sanitizedUpdate.location = String(clinicData.location);
+    if (clinicData.contact !== undefined) sanitizedUpdate.contact = String(clinicData.contact);
+    if (clinicData.email !== undefined) sanitizedUpdate.email = String(clinicData.email);
+    if (logoValue !== undefined) sanitizedUpdate.logo = logoValue;
+    if (clinicData.brandingColor !== undefined) sanitizedUpdate.brandingColor = String(clinicData.brandingColor);
+    if (planStatus !== undefined) sanitizedUpdate.status = planStatus;
+    else if (clinicData.status !== undefined) sanitizedUpdate.status = String(clinicData.status);
+    if (isPlanActive !== undefined) sanitizedUpdate.isActive = isPlanActive;
+    else if (clinicData.isActive !== undefined) sanitizedUpdate.isActive = Boolean(clinicData.isActive);
+    if (clinicData.currency !== undefined) sanitizedUpdate.currency = String(clinicData.currency);
+    if (numberOfUsers !== undefined && numberOfUsers !== '') sanitizedUpdate.userLimit = Number(numberOfUsers);
+    else if (clinicData.userLimit !== undefined) sanitizedUpdate.userLimit = Number(clinicData.userLimit);
+    if (calculatedPlan !== undefined) sanitizedUpdate.subscriptionPlan = calculatedPlan;
+    if (calculatedEnd !== undefined) sanitizedUpdate.subscriptionEnd = calculatedEnd;
+    if (calculatedStart !== undefined) sanitizedUpdate.subscriptionStart = calculatedStart;
+    if (clinicData.modules !== undefined) {
+        sanitizedUpdate.modules = typeof clinicData.modules === 'string' ? clinicData.modules : JSON.stringify(clinicData.modules);
+    }
+    if (clinicData.documentTypes !== undefined) {
+        sanitizedUpdate.documentTypes = typeof clinicData.documentTypes === 'string' ? clinicData.documentTypes : JSON.stringify(clinicData.documentTypes);
+    }
+    if (clinicData.bookingConfig !== undefined) {
+        sanitizedUpdate.bookingConfig = typeof clinicData.bookingConfig === 'string' ? clinicData.bookingConfig : JSON.stringify(clinicData.bookingConfig);
+    }
+
+    // Update clinic with only valid, sanitized fields
+    await prisma.clinic.update({
         where: { id },
-        data: clinicData
+        data: sanitizedUpdate
     });
 
     await prisma.auditlog.create({
@@ -405,11 +475,35 @@ export const updateClinic = async (id: number, data: any) => {
             action: 'Clinic Updated',
             performedBy: 'SUPER_ADMIN',
             clinicId: id,
-            details: JSON.stringify({ clinicId: id, updates: Object.keys(clinicData) })
+            details: JSON.stringify({ clinicId: id, updates: Object.keys(sanitizedUpdate) })
         }
     });
 
-    return clinic;
+    const updatedFullClinic = await prisma.clinic.findUnique({
+        where: { id },
+        include: {
+            clinicstaff: {
+                include: {
+                    user: {
+                        select: { id: true, name: true, email: true, status: true, role: true }
+                    }
+                }
+            },
+            subscriptionInvoices: {
+                where: { status: 'Paid' },
+                select: { amount: true }
+            },
+            _count: {
+                select: {
+                    patient: true,
+                    appointment: true,
+                    subscriptionInvoices: true
+                }
+            }
+        }
+    });
+
+    return formatClinicDetails(updatedFullClinic);
 };
 
 export const toggleClinicStatus = async (id: number) => {
@@ -417,11 +511,20 @@ export const toggleClinicStatus = async (id: number) => {
     if (!clinic) throw new AppError('Clinic not found', 404);
 
     const isActivating = clinic.status !== 'active';
+    let newEnd = clinic.subscriptionEnd;
+    // If activating an expired clinic, give it at least 7 days trial so it is not immediately locked
+    if (isActivating && (!clinic.subscriptionEnd || new Date() > new Date(clinic.subscriptionEnd))) {
+        const ext = new Date();
+        ext.setDate(ext.getDate() + 7);
+        newEnd = ext;
+    }
+
     const updatedClinic = await prisma.clinic.update({
         where: { id },
         data: {
             status: isActivating ? 'active' : 'inactive',
-            isActive: isActivating
+            isActive: isActivating,
+            subscriptionEnd: newEnd
         }
     });
 
@@ -433,7 +536,31 @@ export const toggleClinicStatus = async (id: number) => {
         }
     });
 
-    return updatedClinic;
+    const updatedFullClinic = await prisma.clinic.findUnique({
+        where: { id },
+        include: {
+            clinicstaff: {
+                include: {
+                    user: {
+                        select: { id: true, name: true, email: true, status: true, role: true }
+                    }
+                }
+            },
+            subscriptionInvoices: {
+                where: { status: 'Paid' },
+                select: { amount: true }
+            },
+            _count: {
+                select: {
+                    patient: true,
+                    appointment: true,
+                    subscriptionInvoices: true
+                }
+            }
+        }
+    });
+
+    return formatClinicDetails(updatedFullClinic);
 };
 
 export const deleteClinic = async (id: number) => {
@@ -830,20 +957,25 @@ export const resetClinicAdminPassword = async (userId: number, password: string)
 export const updateClinicSubscription = async (id: number, data: any) => {
     const { subscriptionPlan, subscriptionDuration, manualDays = 30 } = data;
     const start = new Date();
-    const end = new Date();
+    const end = new Date(start);
     if (subscriptionPlan === 'Trial') {
         end.setDate(start.getDate() + 7);
     } else if (subscriptionPlan === 'Manual') {
         end.setDate(start.getDate() + Number(manualDays));
+    } else if (subscriptionPlan === 'Yearly') {
+        end.setFullYear(start.getFullYear() + Number(subscriptionDuration || 1));
     } else {
         end.setMonth(start.getMonth() + Number(subscriptionDuration || 1));
     }
 
-    const updated = await prisma.clinic.update({
+    await prisma.clinic.update({
         where: { id },
         data: {
             subscriptionPlan,
-            subscriptionEnd: end
+            subscriptionStart: start,
+            subscriptionEnd: end,
+            status: 'active',
+            isActive: true
         }
     });
 
@@ -871,7 +1003,31 @@ export const updateClinicSubscription = async (id: number, data: any) => {
         }
     });
 
-    return updated;
+    const updatedFullClinic = await prisma.clinic.findUnique({
+        where: { id },
+        include: {
+            clinicstaff: {
+                include: {
+                    user: {
+                        select: { id: true, name: true, email: true, status: true, role: true }
+                    }
+                }
+            },
+            subscriptionInvoices: {
+                where: { status: 'Paid' },
+                select: { amount: true }
+            },
+            _count: {
+                select: {
+                    patient: true,
+                    appointment: true,
+                    subscriptionInvoices: true
+                }
+            }
+        }
+    });
+
+    return formatClinicDetails(updatedFullClinic);
 };
 
 // ==================== SETTINGS ====================

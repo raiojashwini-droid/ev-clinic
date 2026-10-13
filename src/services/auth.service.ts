@@ -2,6 +2,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../lib/prisma.js';
 import { AppError } from '../utils/AppError.js';
+import { isClinicLicenseExpired } from '../middlewares/auth.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -59,26 +60,31 @@ export const login = async (data: any, ip: string, device: string) => {
         throw new AppError('Incorrect email or password', 401);
     }
 
-    // Reset attempts on successful login
-    await prisma.user.update({
-        where: { id: user.id },
-        data: { failedLoginAttempts: 0, lockoutUntil: null }
-    });
-
-    // Bypass OTP for testing - Return token directly
-
-    // Attempt to fix potential invalid enum values for Super Admin or others
-    try {
-        await prisma.$executeRawUnsafe(`UPDATE clinicstaff SET role = 'RECEPTIONIST' WHERE role = '' OR role IS NULL`);
-    } catch (e) {
-        // Ignore raw query errors (e.g. if syntax differs)
+    // Reset attempts on successful login (only if needed)
+    if (user.failedLoginAttempts > 0 || user.lockoutUntil) {
+        prisma.user.update({
+            where: { id: user.id },
+            data: { failedLoginAttempts: 0, lockoutUntil: null }
+        }).catch(err => console.error('[AUTH] Failed to reset login attempts:', err));
     }
 
     let staffRecords: any[] = [];
     try {
         staffRecords = await prisma.clinicstaff.findMany({
             where: { userId: user.id },
-            include: { clinic: { select: { id: true, status: true } } }
+            include: {
+                clinic: {
+                    select: {
+                        id: true,
+                        name: true,
+                        location: true,
+                        status: true,
+                        isActive: true,
+                        modules: true,
+                        subscriptionEnd: true
+                    }
+                }
+            }
         });
     } catch (e: any) {
         console.error('Error fetching staff records:', e);
@@ -97,23 +103,39 @@ export const login = async (data: any, ip: string, device: string) => {
         // Find all clinics where this patient is registered (by email)
         const patientRecords = await prisma.patient.findMany({
             where: { email: user.email },
-            include: { clinic: { select: { id: true, name: true, location: true, status: true, logo: true } } }
+            include: { clinic: { select: { id: true, name: true, location: true, status: true, logo: true, subscriptionEnd: true, isActive: true } } }
         });
 
         if (patientRecords.length === 0) {
             throw new AppError('No clinic registration found for this patient. Please contact your clinic.', 403);
         }
 
-        // Filter to active clinics only
-        const activeClinics = patientRecords.filter(p => (p.clinic.status || '').toLowerCase() === 'active');
+        // Filter to active and unexpired clinics only
+        const activeClinics = patientRecords.filter(p => !isClinicLicenseExpired(p.clinic));
         if (activeClinics.length === 0) {
-            throw new AppError('All your registered clinics are currently inactive. Please contact your clinic administrator.', 403);
+            throw new AppError('LICENSE_EXPIRED: Please contact Exclusive vision for your license.', 403);
         }
 
         let targetClinicId: number | undefined = undefined;
+        let patientClinicPayload: any = undefined;
 
         if (activeClinics.length === 1) {
             targetClinicId = activeClinics[0].clinicId;
+            const c = activeClinics[0].clinic;
+            const now = new Date();
+            const subEnd = c.subscriptionEnd ? new Date(c.subscriptionEnd) : null;
+            const daysRemaining = subEnd ? Math.ceil((subEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+            patientClinicPayload = {
+                id: c.id,
+                name: c.name,
+                location: c.location || '',
+                role: 'PATIENT',
+                subscriptionEnd: c.subscriptionEnd,
+                daysRemaining: daysRemaining > 0 ? daysRemaining : 0,
+                status: c.status || 'active',
+                isActive: c.isActive !== false,
+                isExpired: false
+            };
         }
 
         const token = signToken({
@@ -122,8 +144,8 @@ export const login = async (data: any, ip: string, device: string) => {
             clinicId: targetClinicId
         });
 
-        // Audit Log
-        await prisma.auditlog.create({
+        // Audit Log (non-blocking)
+        prisma.auditlog.create({
             data: {
                 action: 'Patient Login',
                 performedBy: user.email,
@@ -133,7 +155,7 @@ export const login = async (data: any, ip: string, device: string) => {
                 device: device,
                 details: JSON.stringify({ clinicCount: activeClinics.length })
             }
-        });
+        }).catch(err => console.error('[AUTH] Patient audit log failed:', err));
 
         return {
             success: true,
@@ -145,26 +167,37 @@ export const login = async (data: any, ip: string, device: string) => {
                 role: 'PATIENT',
                 roles: ['PATIENT'],
                 clinics: activeClinics.map(p => p.clinicId),
-                patientClinics: activeClinics.map(p => ({
-                    id: p.clinic.id,
-                    name: p.clinic.name,
-                    location: p.clinic.location,
-                    patientId: p.id
-                }))
+                patientClinics: activeClinics.map(p => {
+                    const now = new Date();
+                    const subEnd = p.clinic.subscriptionEnd ? new Date(p.clinic.subscriptionEnd) : null;
+                    const daysRemaining = subEnd ? Math.ceil((subEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+                    return {
+                        id: p.clinic.id,
+                        name: p.clinic.name,
+                        location: p.clinic.location,
+                        patientId: p.id,
+                        subscriptionEnd: p.clinic.subscriptionEnd,
+                        daysRemaining: daysRemaining > 0 ? daysRemaining : 0,
+                        status: p.clinic.status || 'active',
+                        isActive: p.clinic.isActive !== false,
+                        isExpired: false
+                    };
+                })
             },
+            clinic: patientClinicPayload,
             token
         };
     }
     // ── End PATIENT flow ─────────────────────────────────────────────────────
 
-    // Block login if user is not SUPER_ADMIN and ALL their clinics are inactive
+    // Block login if user is not SUPER_ADMIN and ALL their clinics are inactive or expired
     const isSuperAdminEarly = user.role === 'SUPER_ADMIN';
     if (!isSuperAdminEarly && staffRecords.length > 0) {
         const hasActiveClinic = staffRecords.some(
-            (r: any) => (r.clinic?.status || '').toLowerCase() === 'active'
+            (r: any) => !isClinicLicenseExpired(r.clinic)
         );
         if (!hasActiveClinic) {
-            throw new AppError('Your clinic account is currently inactive. Please contact your administrator.', 403);
+            throw new AppError('LICENSE_EXPIRED: Please contact Exclusive vision for your license.', 403);
         }
     }
 
@@ -186,12 +219,34 @@ export const login = async (data: any, ip: string, device: string) => {
     // Determine the primary role for the token
     let tokenRole = user.role;
     let targetClinicId = undefined;
+    let singleClinicPayload: any = undefined;
 
     if (isSuperAdmin) {
         tokenRole = 'SUPER_ADMIN';
     } else if (staffRecords.length === 1) {
+        const c = staffRecords[0].clinic;
+        if (c && isClinicLicenseExpired(c)) {
+            throw new AppError('LICENSE_EXPIRED: Please contact Exclusive vision for your license.', 403);
+        }
         tokenRole = staffRecords[0].role;
         targetClinicId = staffRecords[0].clinicId;
+        if (c) {
+            const now = new Date();
+            const subEnd = c.subscriptionEnd ? new Date(c.subscriptionEnd) : null;
+            const daysRemaining = subEnd ? Math.ceil((subEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+            singleClinicPayload = {
+                id: c.id,
+                name: c.name,
+                location: c.location || '',
+                role: staffRecords[0].role || tokenRole,
+                modules: c.modules,
+                status: c.status,
+                isActive: c.isActive !== false,
+                subscriptionEnd: c.subscriptionEnd,
+                daysRemaining: daysRemaining > 0 ? daysRemaining : 0,
+                isExpired: false
+            };
+        }
     } else if (staffRecords.length > 1) {
         if (roles.includes('ADMIN')) tokenRole = 'ADMIN';
         else if (roles.includes('DOCTOR')) tokenRole = 'DOCTOR';
@@ -207,17 +262,18 @@ export const login = async (data: any, ip: string, device: string) => {
         clinicId: targetClinicId
     });
 
-    // Audit Log
-    await prisma.auditlog.create({
+    // Audit Log (non-blocking)
+    prisma.auditlog.create({
         data: {
             action: 'Direct Login (2FA Bypassed for Testing)',
             performedBy: user.email,
             userId: user.id,
+            clinicId: targetClinicId,
             ipAddress: ip,
             device: device,
             details: JSON.stringify({ message: 'User logged in directly via bypass' })
         }
-    });
+    }).catch(err => console.error('[AUTH] Audit log failed:', err));
 
     return {
         success: true,
@@ -230,6 +286,7 @@ export const login = async (data: any, ip: string, device: string) => {
             roles,
             clinics: staffRecords.map((r: any) => r.clinicId)
         },
+        clinic: singleClinicPayload,
         token
     };
 };
@@ -362,9 +419,42 @@ export const getMyClinics = async (userId: number) => {
         });
     }
 
+    // If Patient role or staffRecords is empty, look up patient clinic records
+    if (user.role === 'PATIENT' || staffRecords.length === 0) {
+        const patientRecords = await prisma.patient.findMany({
+            where: { email: user.email },
+            include: { clinic: true }
+        });
+        const patientSeen = new Set<number>();
+        const now = new Date();
+        return patientRecords
+            .filter((p: any) => p.clinic && !patientSeen.has(p.clinic.id) && patientSeen.add(p.clinic.id))
+            .map((p: any) => {
+                const isExp = isClinicLicenseExpired(p.clinic);
+                const subEnd = p.clinic.subscriptionEnd ? new Date(p.clinic.subscriptionEnd) : null;
+                const daysRemaining = subEnd
+                    ? Math.ceil((subEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+                    : 0;
+                return {
+                    id: p.clinic.id,
+                    name: p.clinic.name,
+                    role: 'PATIENT',
+                    modules: { pharmacy: true, radiology: true, laboratory: true, billing: true },
+                    location: p.clinic.location,
+                    status: isExp ? 'inactive' : (p.clinic.status || 'active'),
+                    isActive: !isExp,
+                    subscriptionPlan: p.clinic.subscriptionPlan,
+                    subscriptionEnd: p.clinic.subscriptionEnd,
+                    daysRemaining: isExp ? 0 : (daysRemaining > 0 ? daysRemaining : 0),
+                    isExpired: isExp
+                };
+            });
+    }
+
     // For other users, return clinics they are assigned to
     // Deduplicate by clinic id (user can have multiple roles in same clinic)
     const seen = new Set<number>();
+    const now = new Date();
     return staffRecords
         .filter((record: any) => {
             if (seen.has(record.clinic.id)) return false;
@@ -383,13 +473,23 @@ export const getMyClinics = async (userId: number) => {
                 }
             }
 
+            const isExp = isClinicLicenseExpired(record.clinic);
+            const daysRemaining = record.clinic.subscriptionEnd
+                ? Math.ceil((new Date(record.clinic.subscriptionEnd).getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+                : 0;
+
             return {
                 id: record.clinic.id,
                 name: record.clinic.name,
                 role: record.role,
                 modules,
                 location: record.clinic.location,
-                status: record.clinic.status
+                status: isExp ? 'inactive' : (record.clinic.status || 'active'),
+                isActive: !isExp,
+                subscriptionPlan: record.clinic.subscriptionPlan,
+                subscriptionEnd: record.clinic.subscriptionEnd,
+                daysRemaining: isExp ? 0 : (daysRemaining > 0 ? daysRemaining : 0),
+                isExpired: isExp
             };
         });
 };
@@ -405,15 +505,15 @@ export const selectClinic = async (userId: number, clinicId: number, role: strin
     if (isPatient && !isSuperAdmin) {
         const patientRecord = await prisma.patient.findFirst({
             where: { email: user.email, clinicId },
-            include: { clinic: { select: { id: true, name: true, status: true, location: true } } }
+            include: { clinic: { select: { id: true, name: true, status: true, location: true, subscriptionEnd: true, isActive: true } } }
         });
 
         if (!patientRecord) {
             throw new AppError('You are not registered in this clinic', 403);
         }
 
-        if ((patientRecord.clinic.status || '').toLowerCase() !== 'active') {
-            throw new AppError('This clinic is currently inactive. Please contact your clinic administrator.', 403);
+        if (isClinicLicenseExpired(patientRecord.clinic)) {
+            throw new AppError('LICENSE_EXPIRED: Please contact Exclusive vision for your license.', 403);
         }
 
         const token = signToken({
@@ -452,14 +552,14 @@ export const selectClinic = async (userId: number, clinicId: number, role: strin
         throw new AppError('You do not have the requested role in this clinic', 403);
     }
 
-    // Block selection of inactive clinic (SUPER_ADMIN can always proceed)
+    // Block selection of inactive / expired clinic (SUPER_ADMIN can always proceed)
     if (!isSuperAdmin) {
         const clinic = await prisma.clinic.findUnique({
             where: { id: clinicId },
-            select: { status: true, name: true }
+            select: { status: true, name: true, subscriptionEnd: true, isActive: true }
         });
-        if (clinic && (clinic.status || '').toLowerCase() !== 'active') {
-            throw new AppError(`This clinic is currently inactive. Please contact your administrator.`, 403);
+        if (isClinicLicenseExpired(clinic)) {
+            throw new AppError('LICENSE_EXPIRED: Please contact Exclusive vision for your license.', 403);
         }
     }
 
@@ -555,6 +655,23 @@ export const impersonate = async (superAdminId: number, targetUserId: number, ip
     const firstStaffRecord = targetUser.clinicstaff[0];
     const firstClinicId = firstStaffRecord?.clinicId;
 
+    const targetClinic = firstClinicId ? await prisma.clinic.findUnique({
+        where: { id: firstClinicId }
+    }) : null;
+
+    const now = new Date();
+    const isExpired = targetClinic?.subscriptionEnd ? now > new Date(targetClinic.subscriptionEnd) : false;
+    const daysRemaining = targetClinic?.subscriptionEnd
+        ? Math.ceil((new Date(targetClinic.subscriptionEnd).getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+        : 0;
+
+    let modules = { pharmacy: true, radiology: true, laboratory: true, billing: true };
+    if (targetClinic?.modules) {
+        try {
+            modules = typeof targetClinic.modules === 'string' ? JSON.parse(targetClinic.modules) : targetClinic.modules;
+        } catch (e) { }
+    }
+
     // Derive the best role to represent this user
     let targetRole = targetUser.role;
     if (targetUser.role === 'RECEPTIONIST') {
@@ -612,6 +729,19 @@ export const impersonate = async (superAdminId: number, targetUserId: number, ip
                 role: s.role
             }))
         },
+        clinic: targetClinic ? {
+            id: targetClinic.id,
+            name: targetClinic.name,
+            location: targetClinic.location || '',
+            role: targetRole,
+            modules,
+            subscriptionPlan: targetClinic.subscriptionPlan,
+            subscriptionEnd: targetClinic.subscriptionEnd,
+            daysRemaining: isClinicLicenseExpired(targetClinic) ? 0 : (daysRemaining > 0 ? daysRemaining : 0),
+            isExpired: isClinicLicenseExpired(targetClinic),
+            status: isClinicLicenseExpired(targetClinic) ? 'inactive' : (targetClinic.status || 'active'),
+            isActive: !isClinicLicenseExpired(targetClinic)
+        } : null,
         token
     };
 };
@@ -676,6 +806,23 @@ export const impersonateClinic = async (superAdminId: number, clinicId: number, 
         where: { userId: targetUser.id }
     });
 
+    const targetClinic = await prisma.clinic.findUnique({
+        where: { id: clinicId }
+    });
+
+    const now = new Date();
+    const isExpired = targetClinic?.subscriptionEnd ? now > new Date(targetClinic.subscriptionEnd) : false;
+    const daysRemaining = targetClinic?.subscriptionEnd
+        ? Math.ceil((new Date(targetClinic.subscriptionEnd).getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+        : 0;
+
+    let modules = { pharmacy: true, radiology: true, laboratory: true, billing: true };
+    if (targetClinic?.modules) {
+        try {
+            modules = typeof targetClinic.modules === 'string' ? JSON.parse(targetClinic.modules) : targetClinic.modules;
+        } catch (e) { }
+    }
+
     let allRoles = [targetUser.role];
     staffRecords.forEach((s: any) => {
         allRoles.push(s.role);
@@ -700,6 +847,19 @@ export const impersonateClinic = async (superAdminId: number, clinicId: number, 
                 id: s.clinicId,
                 role: s.role
             }))
+        },
+        clinic: {
+            id: clinicId,
+            name: targetClinic?.name || 'Clinic',
+            location: targetClinic?.location || '',
+            role: targetRole,
+            modules,
+            subscriptionPlan: targetClinic?.subscriptionPlan,
+            subscriptionEnd: targetClinic?.subscriptionEnd,
+            daysRemaining: isClinicLicenseExpired(targetClinic) ? 0 : (daysRemaining > 0 ? daysRemaining : 0),
+            isExpired: isClinicLicenseExpired(targetClinic),
+            status: isClinicLicenseExpired(targetClinic) ? 'inactive' : (targetClinic?.status || 'active'),
+            isActive: !isClinicLicenseExpired(targetClinic)
         },
         token
     };

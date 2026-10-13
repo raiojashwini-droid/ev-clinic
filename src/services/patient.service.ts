@@ -1,7 +1,9 @@
 import { prisma } from '../lib/prisma.js';
 import { AppError } from '../utils/AppError.js';
+import { isClinicLicenseExpired } from '../middlewares/auth.js';
 import bcrypt from 'bcryptjs';
-import { isSlotConfirmed, normalizeTime } from '../utils/slotLock.js';
+import { isSlotConfirmed, isDoctorSlotBooked, isDoctorOnDayOff, normalizeTime } from '../utils/slotLock.js';
+import { sendAppointmentBookingConfirmation } from './whatsapp.service.js';
 
 interface CreateAppointmentData {
     clinicId: number;
@@ -491,6 +493,15 @@ export const getMyActivity = async (userId: number, email: string, clinicId?: nu
 };
 
 export const bookAppointment = async (userId: number, email: string, data: CreateAppointmentData) => {
+    // 0. Verify clinic exists and license is not expired
+    const targetClinic = await prisma.clinic.findUnique({
+        where: { id: Number(data.clinicId) },
+        select: { status: true, subscriptionEnd: true, isActive: true }
+    });
+    if (!targetClinic || isClinicLicenseExpired(targetClinic)) {
+        throw new AppError('This clinic is currently inactive or its license has expired. Bookings are temporarily unavailable.', 403);
+    }
+
     // 1. Find or create the patient record for this specific clinic
     let patient = await prisma.patient.findFirst({
         where: {
@@ -513,13 +524,21 @@ export const bookAppointment = async (userId: number, email: string, data: Creat
         });
     }
 
-    // Check if slot is already confirmed and locked for another patient
-    const alreadyLocked = await isSlotConfirmed(prisma, data.clinicId, data.date, data.time);
-    if (alreadyLocked) {
-        throw new AppError(`The selected time slot (${data.time}) is already confirmed and locked for another patient. Please choose a different time slot.`, 400);
+    // 1. Prevent booking on Doctor's scheduled Day Off
+    if (data.doctorId && data.date) {
+        const offDayCheck = await isDoctorOnDayOff(prisma, data.clinicId, Number(data.doctorId), data.date);
+        if (offDayCheck.isOff) {
+            throw new AppError(offDayCheck.reason || 'The doctor is not scheduled on this day.', 400);
+        }
     }
 
-    // 2. Create appointment
+    // 2. Prevent double booking for the same doctor at the same time and date
+    const alreadyBooked = await isDoctorSlotBooked(prisma, data.clinicId, Number(data.doctorId), data.date, data.time);
+    if (alreadyBooked) {
+        throw new AppError(`The selected time slot (${data.time}) is already booked for this doctor. Please choose a different time slot.`, 400);
+    }
+
+    // 3. Create appointment
     const appointment = await prisma.appointment.create({
         data: {
             clinicId: data.clinicId,
@@ -533,6 +552,9 @@ export const bookAppointment = async (userId: number, email: string, data: Creat
             service: data.service || 'Consultation'
         }
     });
+
+    // Send automated WhatsApp appointment confirmation
+    sendAppointmentBookingConfirmation(appointment.id).catch(err => console.error('[WHATSAPP BOOKING ERROR]:', err));
 
     const clinic = await prisma.clinic.findUnique({ where: { id: data.clinicId } });
     if (clinic && clinic.bookingConfig) {
@@ -550,6 +572,15 @@ export const publicBookAppointment = async (data: any) => {
         if (!clinicId || isNaN(Number(clinicId))) throw new AppError('Valid Clinic ID is required', 400);
         if (!doctorId || isNaN(Number(doctorId))) throw new AppError('Valid Doctor ID is required', 400);
         if (!date) throw new AppError('Date is required', 400);
+
+        // 0. Verify clinic exists and license is not expired
+        const targetClinic = await prisma.clinic.findUnique({
+            where: { id: Number(clinicId) },
+            select: { status: true, subscriptionEnd: true, isActive: true }
+        });
+        if (!targetClinic || isClinicLicenseExpired(targetClinic)) {
+            throw new AppError('This clinic is currently inactive or its license has expired. Bookings are temporarily unavailable.', 403);
+        }
 
         // 1. Find or create User - and UPDATE if exists
         let user = await prisma.user.findUnique({ where: { email } });
@@ -613,10 +644,16 @@ export const publicBookAppointment = async (data: any) => {
             throw new AppError('Invalid date format provided', 400);
         }
 
-        // Check if slot is already confirmed and locked
-        const alreadyLocked = await isSlotConfirmed(prisma, Number(clinicId), appointmentDate, time);
-        if (alreadyLocked) {
-            throw new AppError(`The selected time slot (${time}) is already confirmed and locked for another patient. Please choose a different time slot.`, 400);
+        // Prevent booking on Doctor's scheduled Day Off
+        const offDayCheck = await isDoctorOnDayOff(prisma, Number(clinicId), Number(doctorId), appointmentDate);
+        if (offDayCheck.isOff) {
+            throw new AppError(offDayCheck.reason || 'The doctor is not scheduled on this day.', 400);
+        }
+
+        // Check if slot is already booked for this doctor
+        const alreadyBooked = await isDoctorSlotBooked(prisma, Number(clinicId), Number(doctorId), appointmentDate, time);
+        if (alreadyBooked) {
+            throw new AppError(`The selected time slot (${time}) is already booked for this doctor. Please choose a different time slot.`, 400);
         }
 
         // 3. Create Appointment
@@ -636,6 +673,9 @@ export const publicBookAppointment = async (data: any) => {
                 patient: true // Include patient data in response to confirm
             }
         });
+
+        // Send automated WhatsApp appointment confirmation
+        sendAppointmentBookingConfirmation(appointment.id).catch(err => console.error('[WHATSAPP BOOKING ERROR]:', err));
 
         return appointment;
     } catch (error) {

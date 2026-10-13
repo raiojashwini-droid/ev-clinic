@@ -60,6 +60,9 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
 
 export const restrictTo = (...roles: string[]) => {
     return (req: AuthRequest, res: Response, next: NextFunction) => {
+        if (req.user?.role === 'SUPER_ADMIN') {
+            return next();
+        }
         if (!req.user || !roles.includes(req.user.role || '')) {
             console.log(`[403 ERROR] Denied: User ${req.user?.email} | Role: ${req.user?.role} | Expected: ${roles.join(',')}`);
             return next(new AppError('You do not have permission to perform this action', 403));
@@ -114,6 +117,18 @@ export const restrictToClinicRole = (...roles: string[]) => {
     };
 };
 
+export const isClinicLicenseExpired = (clinic: { status?: string | null; subscriptionEnd?: Date | string | null; isActive?: boolean | null } | null | undefined): boolean => {
+    if (!clinic) return true;
+    if (clinic.isActive === false || (clinic.status || '').toLowerCase() !== 'active') return true;
+    if (!clinic.subscriptionEnd) return true;
+    const now = new Date();
+    const subEnd = new Date(clinic.subscriptionEnd);
+    if (isNaN(subEnd.getTime())) return true;
+    if (now > subEnd) return true;
+    const daysRemaining = Math.ceil((subEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+    return daysRemaining <= 0;
+};
+
 export const ensureClinicContext = async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {
         // Priority order for determining clinic context:
@@ -131,7 +146,17 @@ export const ensureClinicContext = async (req: AuthRequest, res: Response, next:
 
         // For PATIENT role, use explicit header selection or token clinicId
         if (req.user?.role === 'PATIENT') {
-            req.clinicId = headerId || clinicId;
+            const targetClinicId = headerId || clinicId;
+            if (targetClinicId) {
+                const clinic = await prisma.clinic.findUnique({
+                    where: { id: targetClinicId },
+                    select: { status: true, subscriptionEnd: true, isActive: true }
+                });
+                if (isClinicLicenseExpired(clinic)) {
+                    return next(new AppError('LICENSE_EXPIRED: Please contact Exclusive vision for your license.', 403));
+                }
+            }
+            req.clinicId = targetClinicId;
             return next();
         }
 
@@ -151,8 +176,30 @@ export const ensureClinicContext = async (req: AuthRequest, res: Response, next:
             clinicId = headerId;
         }
 
+        if (!clinicId && !headerId) {
+            // Fallback: Resolve primary clinic from staff membership
+            const staffRecord = await prisma.clinicstaff.findFirst({
+                where: { userId: req.user!.id }
+            });
+            if (staffRecord) {
+                clinicId = staffRecord.clinicId;
+            }
+        }
+
         if (!clinicId) {
             return next(new AppError('No clinic context found. Please select a clinic.', 400));
+        }
+
+        // Validate license expiry for non-superadmin
+        if (req.user?.role !== 'SUPER_ADMIN') {
+            const clinic = await prisma.clinic.findUnique({
+                where: { id: clinicId },
+                select: { status: true, subscriptionEnd: true, isActive: true }
+            });
+
+            if (isClinicLicenseExpired(clinic)) {
+                return next(new AppError('LICENSE_EXPIRED: Please contact Exclusive vision for your license.', 403));
+            }
         }
 
         req.clinicId = clinicId;
@@ -171,6 +218,19 @@ export const requireModule = (moduleName: string) => {
             const clinicId = req.clinicId;
             if (!clinicId) return next(new AppError('No clinic context found.', 400));
 
+            // Department staff always have access to their department module
+            const userRole = (req.user?.role || '').toUpperCase();
+            let key = moduleName.toLowerCase();
+            if (key === 'lab') key = 'laboratory';
+
+            if (
+                (key === 'pharmacy' && (userRole === 'PHARMACY' || userRole === 'PHARMACIST')) ||
+                (key === 'laboratory' && (userRole === 'LAB' || userRole === 'LABORATORY' || userRole === 'LAB_TECHNICIAN')) ||
+                (key === 'radiology' && (userRole === 'RADIOLOGY' || userRole === 'RADIOLOGIST'))
+            ) {
+                return next();
+            }
+
             const clinic = await prisma.clinic.findUnique({
                 where: { id: clinicId },
                 select: { modules: true }
@@ -178,13 +238,28 @@ export const requireModule = (moduleName: string) => {
 
             if (!clinic) return next(new AppError('Clinic not found.', 404));
 
-            const modules = clinic.modules ? JSON.parse(clinic.modules) : {};
+            let modules: any = {};
+            if (clinic.modules) {
+                try {
+                    modules = typeof clinic.modules === 'string' ? JSON.parse(clinic.modules) : clinic.modules;
+                } catch (e) {
+                    modules = { pharmacy: true, radiology: true, laboratory: true, billing: true };
+                }
+            } else {
+                modules = { pharmacy: true, radiology: true, laboratory: true, billing: true };
+            }
 
-            // Normalize module name (e.g. 'Lab' -> 'laboratory')
-            let key = moduleName.toLowerCase();
-            if (key === 'lab') key = 'laboratory';
+            // Handle Array format: ['pharmacy', 'laboratory']
+            if (Array.isArray(modules)) {
+                const isEnabled = modules.map(m => String(m).toLowerCase()).includes(key);
+                if (!isEnabled && modules.length > 0) {
+                    return next(new AppError(`The ${moduleName} module is not enabled for this clinic.`, 403));
+                }
+                return next();
+            }
 
-            if (!modules[key]) {
+            // Handle Object format: { pharmacy: true, ... }
+            if (modules && modules[key] === false) {
                 return next(new AppError(`The ${moduleName} module is not enabled for this clinic.`, 403));
             }
 
